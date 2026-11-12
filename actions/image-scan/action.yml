@@ -1,0 +1,187 @@
+# Image scan for tenant images (OPS-483): trivy on an image pinned by digest, judged against
+# Strife's image policy. The policy is wieldyapp/wieldy's (OPS-247), vendored in image_scan.py.
+#
+# Blocks (fails the step) on:
+#   - a CRITICAL vulnerability with a fixed version (a rebuild or a bump fixes it),
+#   - any secret in an image layer (a token baked into the image),
+#   - an image or platform that couldn't be scanned (fail closed).
+# HIGH findings, and CRITICAL ones with no fix, are counted in the summary, not blocked.
+# Exceptions: .github/trivy/ignore.yaml in the calling repo (see README.md).
+#
+# Use it in a job of its own that holds no secrets and only `packages: read` (to pull a private
+# image from ghcr.io), and make the deploy job `needs:` it:
+#
+#   scan:
+#     needs: build
+#     runs-on: ubuntu-latest
+#     permissions: { contents: read, packages: read }
+#     steps:
+#       - uses: actions/checkout@<sha>   # only for .github/trivy/ignore.yaml
+#         with: { persist-credentials: false, sparse-checkout: .github/trivy }
+#       - uses: nimble-initiatives/.github/actions/image-scan@<full commit sha>
+#         with:
+#           name: web
+#           image: ghcr.io/nimble-initiatives/x@${{ needs.build.outputs.digest }}
+#
+# Trivy is NOT installed through aquasecurity/trivy-action or setup-trivy. On 2026-03-19 an
+# attacker force-pushed 76 of trivy-action's 77 tags and all of setup-trivy's to a credential
+# stealer, and published a poisoned trivy v0.69.4 (GHSA-69fq-xp46-6x23). So: one release binary,
+# checked against a sha256 committed here (the same as wieldy's; its tarball matched the
+# release's checksums.txt and its sigstore bundle, checked 2026-11-11). Bump by hand, both
+# values at once, to a release at least two weeks old.
+name: Image scan (trivy)
+description: Scan an image pinned by digest with trivy; fail on a fixable critical or a secret in a layer.
+
+inputs:
+  name:
+    description: A name for the image in the summary and the report files ([a-z0-9-], at most 63). Ignored when `targets` is set.
+    required: false
+    default: image
+  image:
+    description: The image, pinned by digest (repo@sha256:…). Ignored when `targets` is set.
+    required: false
+    default: ""
+  platforms:
+    description: Comma-separated platforms to scan. hosting's nodes are all linux/amd64.
+    required: false
+    default: linux/amd64
+  targets:
+    description: >-
+      Several images at once instead: a JSON array of {"name", "image": "repo@sha256:…",
+      "platforms": ["linux/amd64"]}.
+    required: false
+    default: ""
+  ignorefile:
+    description: The calling repo's exceptions file. Missing is fine (no exceptions).
+    required: false
+    default: .github/trivy/ignore.yaml
+  token:
+    description: Token to pull the image from ghcr.io (needs packages:read). Presented to ghcr.io for this org's images only.
+    required: false
+    default: ${{ github.token }}
+  registry-org-prefix:
+    description: The only image prefix the token is presented for.
+    required: false
+    default: ghcr.io/nimble-initiatives/
+  enforce:
+    description: >-
+      "true" fails the step when the policy blocks. "false" only reports (warnings and the
+      summary), for rolling the gate into a repo whose current images don't pass yet. Set a
+      date to turn it on; a gate that never enforces is decoration.
+    required: false
+    default: "true"
+
+outputs:
+  summary:
+    description: The scan summary as markdown (a table per image and platform)
+    value: ${{ steps.evaluate.outputs.summary }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install trivy (pinned, checksum-verified)
+      shell: bash
+      env:
+        TRIVY_VERSION: "0.76.1"
+        TRIVY_SHA256: c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0
+      run: |
+        set -euo pipefail
+        tgz="$RUNNER_TEMP/trivy.tar.gz"
+        curl -fsSL --retry 3 -o "$tgz" \
+          "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+        echo "${TRIVY_SHA256}  $tgz" | sha256sum --check --strict
+        mkdir -p "$RUNNER_TEMP/trivy-bin"
+        tar -xzf "$tgz" -C "$RUNNER_TEMP/trivy-bin" trivy
+        echo "$RUNNER_TEMP/trivy-bin" >> "$GITHUB_PATH"
+
+    - name: Targets and exceptions
+      id: setup
+      shell: bash
+      env:
+        IN_TARGETS: ${{ inputs.targets }}
+        IN_NAME: ${{ inputs.name }}
+        IN_IMAGE: ${{ inputs.image }}
+        IN_PLATFORMS: ${{ inputs.platforms }}
+        IGNOREFILE: ${{ inputs.ignorefile }}
+        ACTION_DIR: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        if [ -n "$IN_TARGETS" ]; then
+          targets=$IN_TARGETS
+        else
+          [ -n "$IN_IMAGE" ] || { echo "::error::image-scan: set \`image\` (repo@sha256:…) or \`targets\`"; exit 1; }
+          targets=$(jq -cn --arg n "$IN_NAME" --arg i "$IN_IMAGE" --arg p "$IN_PLATFORMS" \
+            '[{name: $n, image: $i, platforms: ($p | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(. != "")))}]')
+        fi
+        {
+          echo "targets<<EOF_TARGETS"
+          echo "$targets"
+          echo "EOF_TARGETS"
+        } >> "$GITHUB_OUTPUT"
+        if [ -f "$IGNOREFILE" ]; then
+          python3 -B "$ACTION_DIR/image_scan.py" check-ignores "$IGNOREFILE"
+          echo "ignorefile=$IGNOREFILE" >> "$GITHUB_OUTPUT"
+        else
+          echo "No $IGNOREFILE: scanning without exceptions"
+          : > "$RUNNER_TEMP/no-exceptions.yaml"
+          echo "ignorefile=$RUNNER_TEMP/no-exceptions.yaml" >> "$GITHUB_OUTPUT"
+        fi
+
+    # The token goes to ghcr.io and nowhere else. Never TRIVY_USERNAME/TRIVY_PASSWORD (or
+    # --username/--password): trivy presents those to EVERY registry it talks to, and the DB
+    # download goes to mirror.gcr.io first, so the token would reach Google. A docker config
+    # answers per registry, and image_scan.py hands it only to this org's images.
+    - name: Registry credential for ghcr.io only
+      shell: bash
+      env:
+        GHCR_USER: ${{ github.actor }}
+        GHCR_TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        umask 077
+        mkdir -p "$RUNNER_TEMP/trivy-docker"
+        auth=$(printf '%s:%s' "$GHCR_USER" "$GHCR_TOKEN" | base64 -w0)
+        jq -n --arg auth "$auth" '{auths: {"ghcr.io": {auth: $auth}}}' > "$RUNNER_TEMP/trivy-docker/config.json"
+
+    - name: Scan
+      shell: bash
+      env:
+        TARGETS: ${{ steps.setup.outputs.targets }}
+        DOCKER_CONFIG: ${{ runner.temp }}/trivy-docker
+        IMAGE_SCAN_AUTH_PREFIX: ${{ inputs.registry-org-prefix }}
+        IGNOREFILE: ${{ steps.setup.outputs.ignorefile }}
+        ACTION_DIR: ${{ github.action_path }}
+      run: python3 -B "$ACTION_DIR/image_scan.py" scan --ignorefile "$IGNOREFILE" --out "$RUNNER_TEMP/trivy-reports"
+
+    - name: Drop the registry credential
+      if: ${{ always() }}
+      shell: bash
+      run: rm -rf "$RUNNER_TEMP/trivy-docker"
+
+    - name: Evaluate
+      id: evaluate
+      if: ${{ !cancelled() }}
+      shell: bash
+      env:
+        TARGETS: ${{ steps.setup.outputs.targets }}
+        ACTION_DIR: ${{ github.action_path }}
+        ENFORCE: ${{ inputs.enforce }}
+      run: |
+        set -uo pipefail
+        python3 -B "$ACTION_DIR/image_scan.py" evaluate --reports "$RUNNER_TEMP/trivy-reports"
+        rc=$?
+        if [ "$rc" -ne 0 ] && [ "$ENFORCE" = false ]; then
+          echo "::warning title=Image scan (report-only)::the image policy blocks (see the summary), but enforce is false, so this step passes"
+          exit 0
+        fi
+        exit "$rc"
+
+    # The full reports, kept as evidence of what each digest was judged on.
+    - name: Keep the reports
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: trivy-reports-${{ github.job }}
+        path: ${{ runner.temp }}/trivy-reports/
+        retention-days: 90
+        if-no-files-found: warn
