@@ -1,0 +1,39 @@
+name: image-scan action
+
+on:
+  pull_request:
+    paths: ['actions/image-scan/**', '.github/workflows/image-scan-action.yml']
+  push:
+    branches: [main]
+    paths: ['actions/image-scan/**', '.github/workflows/image-scan-action.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Policy tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Unit tests
+        working-directory: actions/image-scan
+        run: python3 -B -m unittest test_image_scan
+
+  # The action end to end on a small public image: install, scan, evaluate, report-only.
+  smoke:
+    name: Action smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./actions/image-scan
+        with:
+          name: busybox
+          image: busybox@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec # 1.37
+          enforce: "false"
