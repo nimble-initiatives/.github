@@ -167,9 +167,13 @@ runs:
         ACTION_DIR: ${{ github.action_path }}
         ENFORCE: ${{ inputs.enforce }}
       run: |
+        # `shell: bash` runs with -e, which would end this step on evaluate's exit 1 before
+        # report-only mode could turn it into a warning. Take errexit off for that one call.
         set -uo pipefail
+        set +e
         python3 -B "$ACTION_DIR/image_scan.py" evaluate --reports "$RUNNER_TEMP/trivy-reports"
         rc=$?
+        set -e
         if [ "$rc" -ne 0 ] && [ "$ENFORCE" = false ]; then
           echo "::warning title=Image scan (report-only)::the image policy blocks (see the summary), but enforce is false, so this step passes"
           exit 0
@@ -181,7 +185,8 @@ runs:
       if: ${{ !cancelled() }}
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
-        name: trivy-reports-${{ github.job }}
+        # Per job and image name: two uses of the action in one job must not collide.
+        name: trivy-reports-${{ github.job }}-${{ inputs.targets == '' && inputs.name || 'targets' }}
         path: ${{ runner.temp }}/trivy-reports/
         retention-days: 90
         if-no-files-found: warn

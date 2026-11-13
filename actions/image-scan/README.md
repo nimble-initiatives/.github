@@ -47,7 +47,7 @@ job output. Pin this action by **full commit SHA**, never a branch or tag.
 | `token` | `github.token` | presented to ghcr.io for this org's images only |
 
 The run's step summary has a table per image; the full JSON reports are kept as the
-`trivy-reports-<job>` artifact for 90 days.
+`trivy-reports-<job>-<name>` artifact (`-targets` when `targets` is used) for 90 days.
 
 ## When it blocks
 

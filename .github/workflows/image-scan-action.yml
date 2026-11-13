@@ -37,3 +37,36 @@ jobs:
           name: busybox
           image: busybox@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec # 1.37
           enforce: "false"
+
+  # Both enforce modes on an image the policy blocks (python:3.13-alpine from before certifi
+  # 2026.10.18: GHSA-6q48-6c7w-9gw2, a fixable critical). Report-only must pass, enforce must
+  # fail. The passing busybox test above never reaches the blocking path, which is how a
+  # report-only mode that failed anyway shipped (OPS-483).
+  blocked:
+    name: Blocked image, both modes
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Report-only passes on a blocked image
+        uses: ./actions/image-scan
+        with:
+          name: blocked-report-only
+          image: python@sha256:7415fbc3c9e4979cc717d92377ab2bc7b2b4a2af1ac03cc52b5f3f88efedaf3a # 3.13-alpine, 2026-11
+          enforce: "false"
+      - name: Enforce fails on the same image
+        id: enforced
+        continue-on-error: true
+        uses: ./actions/image-scan
+        with:
+          name: blocked-enforced
+          image: python@sha256:7415fbc3c9e4979cc717d92377ab2bc7b2b4a2af1ac03cc52b5f3f88efedaf3a # 3.13-alpine, 2026-11
+          enforce: "true"
+      - name: Enforce did fail
+        env:
+          OUTCOME: ${{ steps.enforced.outcome }}
+        run: |
+          [ "$OUTCOME" = failure ] || { echo "::error::enforce true passed a blocked image (outcome: $OUTCOME)"; exit 1; }
+          echo "enforce true failed the blocked image, as it should"
